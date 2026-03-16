@@ -1,0 +1,39 @@
+replicaCount: 1
+
+image:
+  repository: secret-proxy
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 4000
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: secret-proxy.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+env:
+  UPSTREAM_URL: "https://api.anthropic.com"
+  PORT: "4000"
+  CONFIG_PATH: "/app/config.yaml"
+  TIMEOUT: "120"
+
+configYaml: |
+  upstream: https://api.anthropic.com
+  patterns: []

@@ -1,0 +1,25 @@
+# secret-proxy configuration
+# Patterns here are applied IN ADDITION to detect-secrets built-in rules
+
+upstream: https://api.anthropic.com  # default upstream (can be overridden via env)
+
+patterns:
+  # Internal domains — replace with generic placeholder
+  - name: internal_domain
+    regex: '[a-z0-9-]+\.(internal|local|corp|lan|intranet)'
+    placeholder: "[INTERNAL_DOMAIN]"
+
+  # Private IPv4 ranges
+  - name: internal_ip
+    regex: '(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})'
+    placeholder: "[INTERNAL_IP]"
+
+  # Connection strings
+  - name: connection_string
+    regex: '(?:Server|Host|Data Source)=[a-zA-Z0-9.-]+(?:;|$)'
+    placeholder: "[CONN_HOST]"
+
+  # Add your own patterns below:
+  # - name: my_company_domain
+  #   regex: 'mycompany\.tech'
+  #   placeholder: "[COMPANY_DOMAIN]"
