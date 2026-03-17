@@ -141,8 +141,15 @@ class Scanner:
         # Custom regex patterns
         for pattern in self.custom_patterns:
             for match in pattern["regex"].finditer(masked):
-                value = match.group(0)
-                if value not in vault.values():
+                # If pattern has capture groups — mask only last group (the value part)
+                # Otherwise mask the full match
+                if match.lastindex and match.lastindex >= 2:
+                    value = match.group(match.lastindex)
+                elif match.lastindex:
+                    value = match.group(1)
+                else:
+                    value = match.group(0)
+                if value and value not in vault.values():
                     ph = make_placeholder(pattern["name"].upper())
                     vault[ph] = value
                     masked = masked.replace(value, ph)

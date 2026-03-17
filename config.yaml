@@ -19,6 +19,12 @@ patterns:
     regex: '(?:Server|Host|Data Source)=[a-zA-Z0-9.-]+(?:;|$)'
     placeholder: "[CONN_HOST]"
 
+  # Keyword=value patterns: PASSWORD=xxx, secret: xxx, api_key=xxx etc.
+  # Covers .env files, YAML, JSON, connection strings, inline config
+  - name: keyword_secret
+    regex: '(?i)(?:password|passwd|pwd|secret|api_key|apikey|token|auth|credential|private_key)(\s*[=:]\s*)["\''`]?([^\s\n\r&"''`]{6,})["\''`]?'
+    placeholder: "[KEYWORD_SECRET]"
+
   # Add your own patterns below:
   # - name: my_company_domain
   #   regex: 'mycompany\.tech'
