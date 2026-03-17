@@ -16,10 +16,11 @@ from typing import AsyncGenerator
 import httpx
 import structlog
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import StreamingResponse, Response as FastAPIResponse
+from fastapi.responses import StreamingResponse, Response as FastAPIResponse, JSONResponse
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 from scanner import Scanner
+from policy import PolicyEngine, Action
 
 # ── Structured logging ────────────────────────────────────────────────────────
 
@@ -38,6 +39,7 @@ logger = structlog.get_logger()
 
 app = FastAPI(title="secret-proxy")
 scanner = Scanner(os.getenv("CONFIG_PATH", "config.yaml"))
+policy_engine = PolicyEngine(scanner.cfg)
 
 UPSTREAM = os.getenv("UPSTREAM_URL", "https://api.anthropic.com")
 TIMEOUT = float(os.getenv("TIMEOUT", "120"))
@@ -68,6 +70,11 @@ scan_latency = Histogram(
 active_sessions = Gauge(
     "session_vault_active_sessions",
     "Active session vault entries",
+)
+policy_blocks_total = Counter(
+    "policy_blocks_total",
+    "Total requests blocked by policy",
+    ["profile", "reason"],
 )
 
 
@@ -120,12 +127,16 @@ vault_store = SessionVaultStore(ttl=int(os.getenv("SESSION_VAULT_TTL", "3600")))
 async def health():
     return {
         "status": "ok",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "uptime_seconds": int(time_module.time() - _START_TIME),
         **scanner.status(),
         "session_vault": {
             "active_sessions": vault_store.count(),
             "ttl_seconds": vault_store.ttl,
+        },
+        "policy": {
+            "default_profile": policy_engine.default_profile,
+            "available_profiles": list(policy_engine.profiles.keys()),
         },
     }
 
@@ -240,6 +251,9 @@ async def proxy(request: Request, path: str):
     # Get session id from header (optional)
     session_id = request.headers.get("x-session-id")
 
+    # Scan profile — from header or default
+    profile_name = request.headers.get("x-scan-profile") or None
+
     scan_start = time_module.perf_counter()
 
     # Only mask POST requests with JSON body
@@ -288,6 +302,46 @@ async def proxy(request: Request, path: str):
 
     scan_duration = time_module.perf_counter() - scan_start
     scan_latency.observe(scan_duration)
+
+    # Policy evaluation
+    if request_audit or (request.method == "POST" and body_bytes):
+        decision = policy_engine.evaluate(request_audit, profile_name)
+        if decision.action == Action.BLOCK:
+            effective_profile = profile_name or policy_engine.default_profile
+            policy_blocks_total.labels(
+                profile=effective_profile,
+                reason=decision.reason[:64],
+            ).inc()
+            logger.warning(
+                "policy_block",
+                request_id=request_id,
+                profile=effective_profile,
+                reason=decision.reason,
+                secrets_count=decision.secrets_count,
+                layers=decision.layers_fired,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "policy_violation",
+                    "reason": decision.reason,
+                    "secrets_count": decision.secrets_count,
+                    "layers": decision.layers_fired,
+                    "profile": effective_profile,
+                },
+            )
+        elif decision.action == Action.WARN:
+            logger.warning(
+                "policy_warn",
+                request_id=request_id,
+                reason=decision.reason,
+                secrets_count=decision.secrets_count,
+                layers=decision.layers_fired,
+            )
+            # Pass through WITH masking (warn = log but don't block)
+    else:
+        decision = policy_engine.evaluate([], profile_name)
+
     requests_total.labels(method=request.method, masked="true" if vault else "false").inc()
     if vault:
         # Count per-layer from audit
@@ -345,6 +399,8 @@ async def proxy(request: Request, path: str):
                     layers_used = sorted({entry["layer"] for entry in request_audit})
                     resp_headers["x-secrets-layers"] = ",".join(layers_used)
                 resp_headers["x-request-id"] = request_id
+                resp_headers["x-scan-profile"] = profile_name or policy_engine.default_profile
+                resp_headers["x-policy-action"] = decision.action.value
                 return Response(
                     content=restored.encode("utf-8"),
                     status_code=resp.status_code,

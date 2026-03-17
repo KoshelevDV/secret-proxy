@@ -32,3 +32,65 @@ patterns:
   - name: connection_string
     regex: '(?:Server|Host|Data Source)=[a-zA-Z0-9.-]+(?:;|$)'
     placeholder: "[CONN_HOST]"
+
+# Allowlist — skip masking for trusted values
+allowlist:
+  # Exact strings — never mask these values
+  values: []
+  # Regex patterns — skip masking if secret matches
+  patterns: []
+  # Example:
+  # values:
+  #   - "localhost"
+  #   - "127.0.0.1"
+  # patterns:
+  #   - "^test_.*"
+
+# Scan profiles — select via X-Scan-Profile header or default_profile
+default_profile: standard
+
+profiles:
+  strict:
+    description: "Block all secrets, no exceptions"
+    scanners:
+      gitleaks: true
+      detect_secrets: true
+      keyword_regex: true
+      custom_patterns: true
+      llm: false
+    policy:
+      default_action: block    # block | warn | sanitize
+      max_secrets: 0           # 0 = any secret → block
+      rules: []
+
+  standard:
+    description: "Sanitize secrets, warn on high count"
+    scanners:
+      gitleaks: true
+      detect_secrets: true
+      keyword_regex: true
+      custom_patterns: true
+      llm: false
+    policy:
+      default_action: sanitize
+      max_secrets: 10          # more than 10 → block
+      rules:
+        - layer: gitleaks
+          action: sanitize
+        - layer: keyword_regex
+          action: sanitize
+        - layer: custom
+          action: sanitize
+
+  dev:
+    description: "Warn only, no blocking"
+    scanners:
+      gitleaks: true
+      detect_secrets: false
+      keyword_regex: true
+      custom_patterns: true
+      llm: false
+    policy:
+      default_action: warn
+      max_secrets: null        # no limit
+      rules: []

@@ -241,12 +241,23 @@ class Scanner:
 
         masked = text
 
+        # Allowlist — skip masking for trusted values
+        allowlist_values = set(self.cfg.get("allowlist", {}).get("values", []))
+        allowlist_patterns = [
+            re.compile(p) for p in self.cfg.get("allowlist", {}).get("patterns", [])
+        ]
+
+        def is_allowlisted(value: str) -> bool:
+            if value in allowlist_values:
+                return True
+            return any(p.search(value) for p in allowlist_patterns)
+
         # Deduplicate, longest first (avoid partial replacements)
         seen: set[str] = set()
         for v, layer in sorted(all_tagged, key=lambda x: len(x[0]), reverse=True):
             if v not in seen:
                 seen.add(v)
-                if v in masked:
+                if v in masked and not is_allowlisted(v):
                     ph = make_placeholder("SECRET")
                     vault[ph] = v
                     masked = masked.replace(v, ph)
