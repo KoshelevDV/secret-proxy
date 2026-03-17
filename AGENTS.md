@@ -153,3 +153,50 @@ Then set `scanners.llm: true` in `config.yaml`.
 - [ ] Hot-reload config without restart
 - [ ] Metrics endpoint (masked secrets count, latency per layer)
 - [ ] systemd service for Qwen2.5-Coder-7B on port 8081
+
+## Competitive Landscape
+
+Краткая выжимка из `docs/analysis.md` (полный анализ там).
+
+### Ключевые конкуренты
+
+| Проект | Тип | Лицензия | Главная фича |
+|--------|-----|----------|--------------|
+| LLM Guard | Python SDK | MIT | detect-secrets + Presidio anonymizer pipeline |
+| LiteLLM + Presidio | Gateway proxy | MIT | Per-entity PiiAction policy, DualCache, multi-tenant |
+| Microsoft Presidio | SDK/microservice | MIT | NER-based PII, 20+ entity types, multilingual |
+| Limina (Private AI) | Commercial SaaS | Proprietary | 50+ PII/PHI/PCI types, 52 языка, on-prem container |
+| Nightfall | Commercial SaaS | Proprietary | AI-DLP platform, 100+ models, endpoint agents |
+
+### Наши преимущества
+- **gitleaks** — 700+ named secret rules, лучший coverage для API keys/tokens
+- **LLM layer** — семантическое обнаружение (есть только у нас среди open-source)
+- **Transparent proxy** — ANTHROPIC_BASE_URL override, zero client changes
+- **Simplicity** — ~130 строк proxy.py, `docker compose up -d`
+
+### Наши пробелы (vs зрелые решения)
+- PII detection (NER) — нет, только через LLM layer
+- Policy engine (block/warn/sanitize per type) — нет
+- Audit log — нет
+- Prometheus metrics — нет
+- Multi-tenant API keys — нет
+- Session vault для multi-turn — нет ни у кого open-source (нужно реализовать)
+
+### Vampy (hexway) — не конкурент
+Vampy — AppSec/SAST/DAST platform. Изучен для референса архитектурных паттернов:
+- Quality Gate: условия по критичности (LOW/MEDIUM/HIGH/CRITICAL) + тип сканера + max_value threshold
+- LDAP: полная схема группового маппинга (admin/editor/readonly/blocked groups)
+- OIDC: Keycloak, group-to-role mapping
+- Все используется как референс для будущего v0.4.0 Policy Engine и v0.5.0 LDAP/SSO
+
+## ROADMAP Summary
+
+Детальный ROADMAP в `ROADMAP.md`. Краткие вехи:
+
+| Версия | Что | Срок |
+|--------|-----|------|
+| **v0.2.0** | Session vault, parallel mask, request size limit, structured logging | 2-3 нед |
+| **v0.3.0** | Prometheus /metrics, audit log, X-Secrets-Masked header | +2 нед |
+| **v0.4.0** | Policy engine (block/warn/sanitize), scan profiles, quality gates, allowlist | +3 нед |
+| **v0.5.0** | API key auth, multi-tenant, webhook alerts, LDAP/SSO docs | +2 нед |
+| **v1.0.0** | Redis session vault, hot-reload, admin API, Helm production-ready, e2e tests | +4 нед |
