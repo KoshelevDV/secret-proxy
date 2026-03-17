@@ -1,18 +1,20 @@
 """
-Four-layer secrets scanner (each layer independently toggleable):
-1. gitleaks       — 700+ named rules, precise token formats
-2. detect-secrets — hex entropy + specific detectors (no Base64)
-3. keyword_regex  — password=xxx, token=xxx, secret=xxx patterns
-4. llm            — OpenAI-compatible LLM semantic scan
-5. custom_patterns — user-defined regex from config.yaml
+Four-layer secrets scanner — parallel async execution via asyncio.gather:
+1. gitleaks       — 700+ named rules, precise token formats        (subprocess async)
+2. detect-secrets — hex entropy + specific detectors, no Base64    (run_in_executor)
+3. keyword_regex  — password=xxx, token=xxx, secret=xxx patterns   (sync, instant)
+4. llm            — OpenAI-compatible LLM semantic scan            (httpx async)
+5. custom_patterns — user-defined regex, applied after dedup       (sync)
+
+Layers 1-4 run concurrently. Total latency = max(slowest_layer), not sum.
 """
+import asyncio
 import json
 import os
 import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
 
 import httpx
 import yaml
@@ -40,7 +42,6 @@ class Scanner:
         self.enable_custom = scanners.get("custom_patterns", True)
         self.enable_llm = scanners.get("llm", False)
 
-        # Custom user patterns
         for p in self.cfg.get("patterns", []):
             self.custom_patterns.append({
                 "name": p["name"],
@@ -48,7 +49,6 @@ class Scanner:
                 "placeholder": p.get("placeholder", f"[{p['name'].upper()}]"),
             })
 
-        # Built-in keyword=value patterns (toggleable separately)
         self.keyword_patterns = [
             re.compile(
                 r'(?i)(?:password|passwd|pwd|secret|api_key|apikey|token|auth|credential|private_key)'
@@ -57,7 +57,6 @@ class Scanner:
         ]
 
     def _init_tools(self):
-        # gitleaks
         self.gitleaks_available = False
         if self.enable_gitleaks:
             try:
@@ -66,7 +65,6 @@ class Scanner:
             except Exception:
                 pass
 
-        # detect-secrets
         self.ds_available = False
         if self.enable_ds:
             try:
@@ -87,19 +85,22 @@ class Scanner:
             {"name": "KeywordDetector"},
         ]
 
-    # --- Layer 1: gitleaks ---
+    # ── Layer 1: gitleaks (async subprocess) ─────────────────────────────────
 
-    def _gitleaks_scan(self, text: str) -> list[str]:
+    async def _gitleaks_scan(self, text: str) -> list[str]:
         if not self.gitleaks_available:
             return []
         with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as rf:
             report_path = rf.name
         try:
-            subprocess.run(
-                ['gitleaks', 'detect', '--pipe',
-                 '--report-format', 'json', '--report-path', report_path, '--exit-code', '0'],
-                input=text, capture_output=True, text=True, timeout=15
+            proc = await asyncio.create_subprocess_exec(
+                'gitleaks', 'detect', '--pipe',
+                '--report-format', 'json', '--report-path', report_path, '--exit-code', '0',
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
+            await asyncio.wait_for(proc.communicate(input=text.encode()), timeout=15)
             raw = Path(report_path).read_text().strip()
             findings = json.loads(raw) if raw and raw != 'null' else []
             return [fi['Secret'] for fi in (findings or []) if fi.get('Secret')]
@@ -111,9 +112,10 @@ class Scanner:
             except Exception:
                 pass
 
-    # --- Layer 2: detect-secrets ---
+    # ── Layer 2: detect-secrets (run_in_executor — CPU-bound) ─────────────────
 
-    def _ds_scan(self, text: str) -> list[str]:
+    def _ds_scan_sync(self, text: str) -> list[str]:
+        """Synchronous detect-secrets scan — called via run_in_executor."""
         if not self.ds_available:
             return []
         found = []
@@ -132,10 +134,13 @@ class Scanner:
             pass
         return found
 
-    # --- Layer 3: keyword regex ---
+    async def _ds_scan(self, text: str) -> list[str]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._ds_scan_sync, text)
 
-    def _keyword_scan(self, text: str) -> list[str]:
-        """Returns list of secret values found by keyword patterns."""
+    # ── Layer 3: keyword regex (sync, instant — wrap as coroutine) ────────────
+
+    async def _keyword_scan(self, text: str) -> list[str]:
         if not self.enable_keyword:
             return []
         results = []
@@ -146,9 +151,8 @@ class Scanner:
                     results.append(value)
         return results
 
-    # --- Layer 4: LLM scanner ---
+    # ── Layer 4: LLM (async httpx) ────────────────────────────────────────────
 
-    # Strict system prompt — no reasoning, structured output only
     _LLM_SYSTEM = (
         "You are a security secrets extractor. "
         "Your ONLY task is to output a JSON array of secret values found in user text. "
@@ -164,7 +168,7 @@ class Scanner:
         "Input: ordinary text → Output: []"
     )
 
-    def _llm_scan(self, text: str) -> list[str]:
+    async def _llm_scan(self, text: str) -> list[str]:
         if not self.enable_llm:
             return []
         llm_cfg = self.cfg.get("llm", {})
@@ -174,8 +178,8 @@ class Scanner:
         timeout = float(llm_cfg.get("timeout", 30))
 
         try:
-            with httpx.Client(timeout=timeout) as client:
-                resp = client.post(
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
                     f"{base_url.rstrip('/')}/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}"},
                     json={
@@ -186,20 +190,14 @@ class Scanner:
                         ],
                         "temperature": 0,
                         "max_tokens": 256,
-                        # Disable reasoning/thinking for supported models (GLM, Qwen3 etc.)
                         "enable_thinking": False,
                         "chat_template_kwargs": {"enable_thinking": False},
-                    }
+                    },
                 )
                 resp.raise_for_status()
                 raw = resp.json()["choices"][0]["message"]["content"].strip()
-
-                # Strip <think>...</think> blocks (local reasoning models)
                 raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-                # Strip markdown code fences if model wrapped output
                 raw = re.sub(r'^```(?:json)?\s*', '', raw).rstrip('`').strip()
-
-                # Parse JSON array
                 json_match = re.search(r'\[.*?\]', raw, re.DOTALL)
                 if json_match:
                     secrets = json.loads(json_match.group(0))
@@ -208,10 +206,28 @@ class Scanner:
             pass
         return []
 
-    # --- Masking ---
+    # ── Parallel mask ─────────────────────────────────────────────────────────
 
-    def mask(self, text: str) -> tuple[str, dict]:
-        """Mask secrets. Returns (masked_text, vault)."""
+    async def mask(self, text: str) -> tuple[str, dict]:
+        """
+        Run all scanner layers concurrently, merge results, apply masking.
+        Returns (masked_text, vault).
+        """
+        # All 4 layers run in parallel
+        results = await asyncio.gather(
+            self._gitleaks_scan(text),
+            self._ds_scan(text),
+            self._keyword_scan(text),
+            self._llm_scan(text),
+            return_exceptions=True,
+        )
+
+        all_values: list[str] = []
+        for r in results:
+            if isinstance(r, list):
+                all_values.extend(r)
+            # exceptions are silently ignored (layer failed — others continue)
+
         vault: dict[str, str] = {}
         counter = [0]
 
@@ -221,14 +237,7 @@ class Scanner:
 
         masked = text
 
-        # Collect from all layers
-        all_values: list[str] = []
-        all_values.extend(self._gitleaks_scan(text))
-        all_values.extend(self._ds_scan(text))
-        all_values.extend(self._keyword_scan(text))
-        all_values.extend(self._llm_scan(text))
-
-        # Deduplicate, longest first
+        # Deduplicate, longest first (avoid partial replacements)
         seen: set[str] = set()
         for v in sorted(all_values, key=len, reverse=True):
             if v not in seen:
@@ -238,7 +247,7 @@ class Scanner:
                     vault[ph] = v
                     masked = masked.replace(v, ph)
 
-        # Custom regex patterns (user-defined, only if enabled)
+        # Custom regex (applied after dedup — these are structural patterns)
         if self.enable_custom:
             for pattern in self.custom_patterns:
                 for match in pattern["regex"].finditer(masked):
@@ -262,7 +271,6 @@ class Scanner:
         return result
 
     def status(self) -> dict:
-        """Return current scanner configuration and availability."""
         return {
             "gitleaks": {"enabled": self.enable_gitleaks, "available": self.gitleaks_available},
             "detect_secrets": {"enabled": self.enable_ds, "available": self.ds_available},

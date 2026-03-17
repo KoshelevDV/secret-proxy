@@ -25,34 +25,33 @@ async def health():
     return {"status": "ok", **scanner.status()}
 
 
-def _mask_body(body: dict) -> tuple[dict, dict]:
-    """Mask all text content in OpenAI/Anthropic request body."""
+async def _mask_body(body: dict) -> tuple[dict, dict]:
+    """Mask all text content in OpenAI/Anthropic request body (async, parallel layers)."""
     masked = copy.deepcopy(body)
     combined_vault: dict[str, str] = {}
 
-    def mask_text(text: str) -> str:
-        masked_t, vault = scanner.mask(text)
+    async def mask_text(text: str) -> str:
+        masked_t, vault = await scanner.mask(text)
         combined_vault.update(vault)
         return masked_t
 
-    def process_content(content):
+    async def process_content(content):
         if isinstance(content, str):
-            return mask_text(content)
+            return await mask_text(content)
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    block["text"] = mask_text(block.get("text", ""))
+                    block["text"] = await mask_text(block.get("text", ""))
         return content
 
     for msg in masked.get("messages", []):
-        msg["content"] = process_content(msg.get("content", ""))
+        msg["content"] = await process_content(msg.get("content", ""))
 
     if "system" in masked:
-        masked["system"] = process_content(masked["system"])
+        masked["system"] = await process_content(masked["system"])
 
-    # OpenAI-style: top-level prompt (completions API)
     if "prompt" in masked and isinstance(masked["prompt"], str):
-        masked["prompt"] = mask_text(masked["prompt"])
+        masked["prompt"] = await mask_text(masked["prompt"])
 
     return masked, combined_vault
 
@@ -70,7 +69,7 @@ async def proxy(request: Request, path: str):
     if request.method == "POST" and body_bytes:
         try:
             body = json.loads(body_bytes)
-            masked_body, vault = _mask_body(body)
+            masked_body, vault = await _mask_body(body)
             body_bytes = json.dumps(masked_body).encode()
             headers["content-length"] = str(len(body_bytes))
         except Exception:
