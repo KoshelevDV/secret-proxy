@@ -12,7 +12,7 @@ scanners:
 llm:
   base_url: http://10.0.30.18:8081/v1
   api_key: dummy
-  model: local
+  model: "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
   timeout: 10
 
 # Custom patterns (regex, applied on top of built-in scanners)
