@@ -13,7 +13,7 @@ llm:
   base_url: http://10.0.30.18:8081/v1
   api_key: dummy
   model: local
-  timeout: 30
+  timeout: 10
 
 # Custom patterns (regex, applied on top of built-in scanners)
 patterns:
