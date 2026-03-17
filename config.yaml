@@ -10,7 +10,7 @@ scanners:
 # LLM scanner config (used when scanners.llm: true)
 # Prompt is strict and hardcoded in scanner.py — thinking/reasoning disabled automatically
 llm:
-  base_url: http://10.0.30.18:8080/v1
+  base_url: http://10.0.30.18:8081/v1
   api_key: dummy
   model: local
   timeout: 30
