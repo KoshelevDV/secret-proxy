@@ -8,17 +8,12 @@ scanners:
   llm: false              # LLM semantic scan (set true + configure llm: section)
 
 # LLM scanner config (used when scanners.llm: true)
+# Prompt is strict and hardcoded in scanner.py — thinking/reasoning disabled automatically
 llm:
   base_url: http://10.0.30.18:8080/v1
   api_key: dummy
   model: local
   timeout: 30
-  prompt: |
-    You are a security scanner. Find ALL secrets, API keys, passwords, tokens,
-    connection strings, and sensitive values in the following text.
-    Return ONLY a JSON array of found secret values (strings), nothing else.
-    If nothing found, return [].
-    Text:
 
 # Custom patterns (regex, applied on top of built-in scanners)
 patterns:

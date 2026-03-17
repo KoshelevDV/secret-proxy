@@ -148,6 +148,22 @@ class Scanner:
 
     # --- Layer 4: LLM scanner ---
 
+    # Strict system prompt — no reasoning, structured output only
+    _LLM_SYSTEM = (
+        "You are a security secrets extractor. "
+        "Your ONLY task is to output a JSON array of secret values found in user text. "
+        "Rules:\n"
+        "- Output ONLY a valid JSON array: [\"value1\", \"value2\"] or []\n"
+        "- No explanations, no markdown, no code blocks, no commentary\n"
+        "- Include: passwords, API keys, tokens, private keys, connection string values\n"
+        "- Exclude: variable names, keywords, placeholders like [SECRET_1]\n"
+        "- If nothing sensitive found: output exactly []\n"
+        "Examples:\n"
+        "Input: password=hunter2 → Output: [\"hunter2\"]\n"
+        "Input: token: abc123xyz → Output: [\"abc123xyz\"]\n"
+        "Input: ordinary text → Output: []"
+    )
+
     def _llm_scan(self, text: str) -> list[str]:
         if not self.enable_llm:
             return []
@@ -156,12 +172,6 @@ class Scanner:
         api_key = llm_cfg.get("api_key", "dummy")
         model = llm_cfg.get("model", "local")
         timeout = float(llm_cfg.get("timeout", 30))
-        prompt_prefix = llm_cfg.get("prompt", (
-            "You are a security scanner. Find ALL secrets, API keys, passwords, tokens, "
-            "connection strings, and sensitive values in the following text. "
-            "Return ONLY a JSON array of found secret values (strings), nothing else. "
-            "If nothing found, return [].\nText:\n"
-        ))
 
         try:
             with httpx.Client(timeout=timeout) as client:
@@ -171,16 +181,26 @@ class Scanner:
                     json={
                         "model": model,
                         "messages": [
-                            {"role": "user", "content": f"{prompt_prefix}{text}"}
+                            {"role": "system", "content": self._LLM_SYSTEM},
+                            {"role": "user", "content": text},
                         ],
                         "temperature": 0,
-                        "max_tokens": 512,
+                        "max_tokens": 256,
+                        # Disable reasoning/thinking for supported models (GLM, Qwen3 etc.)
+                        "enable_thinking": False,
+                        "chat_template_kwargs": {"enable_thinking": False},
                     }
                 )
                 resp.raise_for_status()
-                content = resp.json()["choices"][0]["message"]["content"].strip()
-                # Extract JSON array from response (LLM might wrap it in markdown)
-                json_match = re.search(r'\[.*?\]', content, re.DOTALL)
+                raw = resp.json()["choices"][0]["message"]["content"].strip()
+
+                # Strip <think>...</think> blocks (local reasoning models)
+                raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+                # Strip markdown code fences if model wrapped output
+                raw = re.sub(r'^```(?:json)?\s*', '', raw).rstrip('`').strip()
+
+                # Parse JSON array
+                json_match = re.search(r'\[.*?\]', raw, re.DOTALL)
                 if json_match:
                     secrets = json.loads(json_match.group(0))
                     return [s for s in secrets if isinstance(s, str) and len(s) >= 4]
