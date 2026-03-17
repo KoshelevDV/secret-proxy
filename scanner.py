@@ -208,10 +208,11 @@ class Scanner:
 
     # ── Parallel mask ─────────────────────────────────────────────────────────
 
-    async def mask(self, text: str) -> tuple[str, dict]:
+    async def mask(self, text: str) -> tuple[str, dict, list[dict]]:
         """
         Run all scanner layers concurrently, merge results, apply masking.
-        Returns (masked_text, vault).
+        Returns (masked_text, vault, audit_log).
+        audit_log entries: {"placeholder": str, "layer": str, "length": int}
         """
         # All 4 layers run in parallel
         results = await asyncio.gather(
@@ -222,13 +223,16 @@ class Scanner:
             return_exceptions=True,
         )
 
-        all_values: list[str] = []
-        for r in results:
+        layer_names = ["gitleaks", "detect_secrets", "keyword_regex", "llm"]
+        all_tagged: list[tuple[str, str]] = []  # (value, layer)
+        for layer_name, r in zip(layer_names, results):
             if isinstance(r, list):
-                all_values.extend(r)
+                for v in r:
+                    all_tagged.append((v, layer_name))
             # exceptions are silently ignored (layer failed — others continue)
 
         vault: dict[str, str] = {}
+        audit: list[dict] = []
         counter = [0]
 
         def make_placeholder(category: str) -> str:
@@ -239,13 +243,18 @@ class Scanner:
 
         # Deduplicate, longest first (avoid partial replacements)
         seen: set[str] = set()
-        for v in sorted(all_values, key=len, reverse=True):
+        for v, layer in sorted(all_tagged, key=lambda x: len(x[0]), reverse=True):
             if v not in seen:
                 seen.add(v)
                 if v in masked:
                     ph = make_placeholder("SECRET")
                     vault[ph] = v
                     masked = masked.replace(v, ph)
+                    audit.append({
+                        "placeholder": ph,
+                        "layer": layer,
+                        "length": len(v),
+                    })
 
         # Custom regex (applied after dedup — these are structural patterns)
         if self.enable_custom:
@@ -261,8 +270,13 @@ class Scanner:
                         ph = make_placeholder(pattern["name"].upper())
                         vault[ph] = value
                         masked = masked.replace(value, ph)
+                        audit.append({
+                            "placeholder": ph,
+                            "layer": "custom",
+                            "length": len(value),
+                        })
 
-        return masked, vault
+        return masked, vault, audit
 
     def restore(self, text: str, vault: dict) -> str:
         result = text

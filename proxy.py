@@ -8,13 +8,16 @@ import hashlib
 import json
 import os
 import time
+import time as time_module
+import uuid
 from threading import Lock
 from typing import AsyncGenerator
 
 import httpx
 import structlog
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response as FastAPIResponse
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 from scanner import Scanner
 
@@ -39,9 +42,33 @@ scanner = Scanner(os.getenv("CONFIG_PATH", "config.yaml"))
 UPSTREAM = os.getenv("UPSTREAM_URL", "https://api.anthropic.com")
 TIMEOUT = float(os.getenv("TIMEOUT", "120"))
 
-# Cache: sha256(text) -> (masked_text, vault)
-_mask_cache: dict[str, tuple[str, dict[str, str]]] = {}
+_START_TIME = time_module.time()
+
+# Cache: sha256(text) -> (masked_text, vault, audit)
+_mask_cache: dict[str, tuple[str, dict[str, str], list[dict]]] = {}
 _CACHE_MAX = 2048
+
+# ── Prometheus Metrics ────────────────────────────────────────────────────────
+
+secrets_masked_total = Counter(
+    "secrets_masked_total",
+    "Total secrets masked",
+    ["layer"],
+)
+requests_total = Counter(
+    "proxy_requests_total",
+    "Total proxy requests",
+    ["method", "masked"],
+)
+scan_latency = Histogram(
+    "scan_latency_seconds",
+    "Scan latency per request",
+    buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
+)
+active_sessions = Gauge(
+    "session_vault_active_sessions",
+    "Active session vault entries",
+)
 
 
 # ── Session Vault Store ───────────────────────────────────────────────────────
@@ -93,6 +120,8 @@ vault_store = SessionVaultStore(ttl=int(os.getenv("SESSION_VAULT_TTL", "3600")))
 async def health():
     return {
         "status": "ok",
+        "version": "0.3.0",
+        "uptime_seconds": int(time_module.time() - _START_TIME),
         **scanner.status(),
         "session_vault": {
             "active_sessions": vault_store.count(),
@@ -101,23 +130,32 @@ async def health():
     }
 
 
+@app.get("/metrics")
+async def metrics():
+    active_sessions.set(vault_store.count())
+    return FastAPIResponse(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
+
 # ── Masking helpers ───────────────────────────────────────────────────────────
 
-async def _cached_mask(text: str) -> tuple[str, dict[str, str]]:
+async def _cached_mask(text: str) -> tuple[str, dict[str, str], list[dict]]:
     """Mask text with in-memory cache keyed by sha256."""
     key = hashlib.sha256(text.encode()).hexdigest()
     if key in _mask_cache:
         return _mask_cache[key]
-    masked_t, vault = await scanner.mask(text)
+    masked_t, vault, audit = await scanner.mask(text)
     if len(_mask_cache) >= _CACHE_MAX:
         # evict oldest quarter
         for old_key in list(_mask_cache)[: _CACHE_MAX // 4]:
             _mask_cache.pop(old_key, None)
-    _mask_cache[key] = (masked_t, vault)
-    return masked_t, vault
+    _mask_cache[key] = (masked_t, vault, audit)
+    return masked_t, vault, audit
 
 
-async def _mask_body(body: dict) -> tuple[dict, dict]:
+async def _mask_body(body: dict) -> tuple[dict, dict, list[dict]]:
     """Mask text content in the request body.
 
     Only the last user message is scanned (Claude API resends full history
@@ -127,12 +165,14 @@ async def _mask_body(body: dict) -> tuple[dict, dict]:
     """
     masked = copy.deepcopy(body)
     combined_vault: dict[str, str] = {}
+    combined_audit: list[dict] = []
     vault_lock = asyncio.Lock()
 
     async def mask_text(text: str) -> str:
-        masked_t, vault = await _cached_mask(text)
+        masked_t, vault, audit = await _cached_mask(text)
         async with vault_lock:
             combined_vault.update(vault)
+            combined_audit.extend(audit)
         return masked_t
 
     async def process_content(content):
@@ -178,7 +218,7 @@ async def _mask_body(body: dict) -> tuple[dict, dict]:
     if "prompt" in masked and isinstance(masked["prompt"], str):
         masked["prompt"] = await mask_text(masked["prompt"])
 
-    return masked, combined_vault
+    return masked, combined_vault, combined_audit
 
 
 # ── Main proxy handler ────────────────────────────────────────────────────────
@@ -191,9 +231,16 @@ async def proxy(request: Request, path: str):
     headers.pop("content-length", None)
 
     vault: dict[str, str] = {}
+    request_audit: list[dict] = []
+
+    # Request ID — propagate or generate
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())[:8]
+    headers["x-request-id"] = request_id
 
     # Get session id from header (optional)
     session_id = request.headers.get("x-session-id")
+
+    scan_start = time_module.perf_counter()
 
     # Only mask POST requests with JSON body
     if request.method == "POST" and body_bytes:
@@ -203,6 +250,7 @@ async def proxy(request: Request, path: str):
             if len(body_bytes) > max_body_kb * 1024:
                 logger.warning(
                     "request_too_large",
+                    request_id=request_id,
                     size_kb=len(body_bytes) // 1024,
                     limit_kb=max_body_kb,
                     path=path,
@@ -210,7 +258,7 @@ async def proxy(request: Request, path: str):
                 # Pass through unmasked — don't block, just skip masking
             else:
                 body = json.loads(body_bytes)
-                masked_body, vault = await _mask_body(body)
+                masked_body, vault, request_audit = await _mask_body(body)
                 body_bytes = json.dumps(masked_body).encode()
                 headers["content-length"] = str(len(body_bytes))
 
@@ -226,7 +274,7 @@ async def proxy(request: Request, path: str):
                 if vault:
                     logger.info(
                         "request_masked",
-                        request_id=request.headers.get("x-request-id", "-"),
+                        request_id=request_id,
                         session_id=session_id or "none",
                         secrets_count=len(vault),
                         secret_keys=list(vault.keys()),
@@ -237,6 +285,20 @@ async def proxy(request: Request, path: str):
                 vault = full_vault
         except Exception:
             pass  # pass through as-is
+
+    scan_duration = time_module.perf_counter() - scan_start
+    scan_latency.observe(scan_duration)
+    requests_total.labels(method=request.method, masked="true" if vault else "false").inc()
+    if vault:
+        # Count per-layer from audit
+        layer_counts: dict[str, int] = {}
+        for entry in request_audit:
+            layer = entry.get("layer", "unknown")
+            layer_counts[layer] = layer_counts.get(layer, 0) + 1
+        for layer, count in layer_counts.items():
+            secrets_masked_total.labels(layer=layer).inc(count)
+        # total counter
+        secrets_masked_total.labels(layer="total").inc(len(vault))
 
     url = f"{UPSTREAM.rstrip('/')}/{path}"
     if request.url.query:
@@ -277,6 +339,12 @@ async def proxy(request: Request, path: str):
                 resp_headers = dict(resp.headers)
                 resp_headers.pop("content-encoding", None)  # avoid gzip mismatch
                 resp_headers.pop("content-length", None)
+                # Observability headers
+                resp_headers["x-secrets-masked"] = str(len(vault))
+                if vault and request_audit:
+                    layers_used = sorted({entry["layer"] for entry in request_audit})
+                    resp_headers["x-secrets-layers"] = ",".join(layers_used)
+                resp_headers["x-request-id"] = request_id
                 return Response(
                     content=restored.encode("utf-8"),
                     status_code=resp.status_code,
