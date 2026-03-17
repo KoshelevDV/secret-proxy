@@ -22,11 +22,7 @@ TIMEOUT = float(os.getenv("TIMEOUT", "120"))
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "gitleaks": scanner.gitleaks_available,
-        "detect_secrets": scanner.ds_available,
-    }
+    return {"status": "ok", **scanner.status()}
 
 
 def _mask_body(body: dict) -> tuple[dict, dict]:

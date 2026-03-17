@@ -1,31 +1,35 @@
 # secret-proxy configuration
-# Patterns here are applied IN ADDITION to detect-secrets built-in rules
 
-upstream: https://api.anthropic.com  # default upstream (can be overridden via env)
+scanners:
+  gitleaks: true          # gitleaks binary (700+ named rules)
+  detect_secrets: true    # detect-secrets Python lib
+  keyword_regex: true     # password=xxx, token=xxx etc.
+  custom_patterns: true   # patterns defined below
+  llm: false              # LLM semantic scan (set true + configure llm: section)
 
+# LLM scanner config (used when scanners.llm: true)
+llm:
+  base_url: http://10.0.30.18:8080/v1
+  api_key: dummy
+  model: local
+  timeout: 30
+  prompt: |
+    You are a security scanner. Find ALL secrets, API keys, passwords, tokens,
+    connection strings, and sensitive values in the following text.
+    Return ONLY a JSON array of found secret values (strings), nothing else.
+    If nothing found, return [].
+    Text:
+
+# Custom patterns (regex, applied on top of built-in scanners)
 patterns:
-  # Internal domains — replace with generic placeholder
   - name: internal_domain
     regex: '[a-z0-9-]+\.(internal|local|corp|lan|intranet)'
     placeholder: "[INTERNAL_DOMAIN]"
 
-  # Private IPv4 ranges
   - name: internal_ip
     regex: '(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})'
     placeholder: "[INTERNAL_IP]"
 
-  # Connection strings
   - name: connection_string
     regex: '(?:Server|Host|Data Source)=[a-zA-Z0-9.-]+(?:;|$)'
     placeholder: "[CONN_HOST]"
-
-  # Keyword=value patterns: PASSWORD=xxx, secret: xxx, api_key=xxx etc.
-  # Covers .env files, YAML, JSON, connection strings, inline config
-  - name: keyword_secret
-    regex: '(?i)(?:password|passwd|pwd|secret|api_key|apikey|token|auth|credential|private_key)(\s*[=:]\s*)["\''`]?([^\s\n\r&"''`]{6,})["\''`]?'
-    placeholder: "[KEYWORD_SECRET]"
-
-  # Add your own patterns below:
-  # - name: my_company_domain
-  #   regex: 'mycompany\.tech'
-  #   placeholder: "[COMPANY_DOMAIN]"
