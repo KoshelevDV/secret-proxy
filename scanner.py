@@ -135,7 +135,7 @@ class Scanner:
         return found
 
     async def _ds_scan(self, text: str) -> list[str]:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._ds_scan_sync, text)
 
     # ── Layer 3: keyword regex (sync, instant — wrap as coroutine) ────────────

@@ -15,6 +15,10 @@ llm:
   model: "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
   timeout: 10
 
+# Request size limits
+limits:
+  max_body_size_kb: 500   # requests larger than this are passed through unmasked
+
 # Custom patterns (regex, applied on top of built-in scanners)
 patterns:
   - name: internal_domain
