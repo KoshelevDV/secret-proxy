@@ -49,6 +49,8 @@ class Scanner:
             self.ds_available = False
 
         # Verified plugin names for this detect-secrets version
+        # KeywordDetector catches password=, secret=, token= etc.
+        # No Base64HighEntropyString — too many false positives on regular words
         self._ds_plugins = [
             {"name": "HexHighEntropyString", "limit": 3.5},
             {"name": "AWSKeyDetector"},
@@ -57,28 +59,31 @@ class Scanner:
             {"name": "BasicAuthDetector"},
             {"name": "GitHubTokenDetector"},
             {"name": "GitLabTokenDetector"},
+            {"name": "KeywordDetector"},
         ]
 
     def _gitleaks_scan(self, text: str) -> list[str]:
-        """Returns list of secret values found by gitleaks."""
+        """Returns list of secret values found by gitleaks via --pipe mode."""
         if not self.gitleaks_available:
             return []
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
-            f.write(text)
-            tmp = f.name
+        # Use a temp file for report output — /dev/stdout doesn't work reliably
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as rf:
+            report_path = rf.name
         try:
             result = subprocess.run(
-                ['gitleaks', 'detect', '--source', tmp, '--no-git',
-                 '--report-format', 'json', '--report-path', '/dev/stdout', '--exit-code', '0'],
-                capture_output=True, text=True, timeout=15
+                ['gitleaks', 'detect', '--pipe',
+                 '--report-format', 'json', '--report-path', report_path, '--exit-code', '0'],
+                input=text, capture_output=True, text=True, timeout=15
             )
-            findings = json.loads(result.stdout) if result.stdout.strip() and result.stdout.strip() != 'null' else []
-            return [f['Secret'] for f in (findings or []) if f.get('Secret')]
+            with open(report_path) as f:
+                raw = f.read().strip()
+            findings = json.loads(raw) if raw and raw != 'null' else []
+            return [fi['Secret'] for fi in (findings or []) if fi.get('Secret')]
         except Exception:
             return []
         finally:
             try:
-                os.unlink(tmp)
+                os.unlink(report_path)
             except Exception:
                 pass
 
